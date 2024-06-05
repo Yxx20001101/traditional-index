@@ -4,21 +4,22 @@ import time
 import numpy as np
 from Curves import *
 
-# QUERY_FILE = r'E:\Python_Projects\RTree\查询\6万查询.txt'
-QUERY_FILE = r'E:\Python_Projects\RTree\查询\point_query.txt'
+QUERY_FILE = r'E:\Python_Projects\RTree\查询\6万查询.txt'
+# QUERY_FILE = r'E:\Python_Projects\RTree\查询\point_query.txt'
 # QUERY_FILE = r'E:\Python_Projects\RTree\查询\query_uniform.txt'
 
 # INDEX_FILE = r'E:\Python_Projects\RTree\index\index6.idx'
-INDEX_FILE = r'E:\Python_Projects\RTree\index\index_800W_uni.idx'
-ORI_FILE = r'E:\Python_Projects\RTree\data\data.txt'
+INDEX_FILE = r'E:\Python_Projects\RTree\index\index_RST.idx'
+ORI_FILE = r'E:\Python_Projects\RTree\data\60W_STR.txt'
 D_FILE = ORI_FILE.split('.')[0] + '.dat'
 
 
 DB_COUNT = 0
 point_count = 0
+record_offset = 0  # 记录在块内的序号（偏移量）
 BLOCK_SIZE = 4 * 1024  # 块大小
 IO_COUNT = 0  # 计算IO次数
-BUFFER_SIZE = 100000000000000  # 缓冲容量
+BUFFER_SIZE = 256 # 缓冲容量
 MAX_ITEM_AMOUNT = (BLOCK_SIZE-45)//36  # 索引块最大容量
 
 
@@ -33,7 +34,7 @@ def str_sort(file=ORI_FILE):
     # 先按照x轴排序
     data_sorted_x = np_data[np_data[:, 0].argsort()]
     # 数据块最大容量
-    dblock_cap = (BLOCK_SIZE-8)//16
+    dblock_cap = (BLOCK_SIZE-8)//20
     # 叶子数目
     P = np.ceil(np_data.shape[0] // dblock_cap)
     # 切片数目
@@ -339,7 +340,7 @@ class Query(Operation):
                             dblock = Data.load_dblock(dblock_id)
                             IO_COUNT += 1
                             self.datacache.add_dblock(dblock)
-                        for x, y in dblock.data_points:
+                        for ofst, x, y in dblock.data_points:
                             if x == point[0] and y == point[1]:
                                 result.add((x, y))
                                 # result.append((poi.x,poi.y))
@@ -386,7 +387,7 @@ class Query(Operation):
         while len(overlap_node_list) > 0:  # 层次遍历
                 node = overlap_node_list.pop(0)
                 if node.is_leaf:  # 检测叶子结点
-                    for mbr,dblock_id in node.item_list:
+                    for mbr, dblock_id in node.item_list:
                         if self.is_overlap(range,mbr):
                             result_dblock_id_set.add(dblock_id)
                 else:  # 检测内部节点
@@ -406,7 +407,7 @@ class Query(Operation):
                 dblock = Data.load_dblock(dblock_id)
                 IO_COUNT += 1
                 self.datacache.add_dblock(dblock)
-            for x, y in dblock.data_points:
+            for ofst, x, y in dblock.data_points:
                 if self.is_contained(range, [x, y]):
                     result.add((x,y))
                     # result.append((point.x, point.y))
@@ -879,6 +880,7 @@ class Index(Operation):
 class Data:
     """
     数据类，形成数据文件
+    数据在数据块内的形式为：(number(offset),x,y)，其中number为记录在块内的序号
     """
     def __init__(self, d_cache, index, d_file=D_FILE):
         self.d_file = d_file
@@ -904,10 +906,12 @@ class Data:
     def insert_points(self, point):
         global DB_COUNT
         global point_count
+        global record_offset
         db = self.choose_dblock(point)
         print(f'插入第{point_count}个点')
         point_count += 1
-        db.add_points(point)
+        db.add_points((record_offset, point[0], point[1]))
+        record_offset += 1
         """
         数据块如果满了，则：
         1   将数据块对应的ID和mbr加入索引块
@@ -915,6 +919,7 @@ class Data:
         """
         if db.is_overflow():
             mbr = db.get_dblock_mbr()
+            record_offset = 0
             self.index.create_Index([mbr, db.block_id])
             self.create_new_block()
 
@@ -959,12 +964,12 @@ class DataBlock:
         self.data_points = []  # 存储Point对象
 
     def is_overflow(self):
-        return (len(self.data_points) + 1) * 16 + 8 > BLOCK_SIZE
+        return (len(self.data_points) + 1) * 20 + 8 > BLOCK_SIZE
 
     def pack(self):
         binfo = struct.pack('2I', self.block_id, len(self.data_points))
-        for x, y in self.data_points:
-            binfo = binfo + struct.pack('2d', x, y)
+        for offset, x, y in self.data_points:
+            binfo = binfo + struct.pack('<I2d', offset, x, y)
         return binfo
 
     @staticmethod
@@ -973,11 +978,13 @@ class DataBlock:
         dblock = DataBlock(block_id)
         offset = 8
         for i in range(length):
+            off = struct.unpack('I', bindata[offset: offset + 4])[0]
+            offset += 4
             x = struct.unpack('d', bindata[offset:offset+8])[0]
             offset += 8
             y = struct.unpack('d', bindata[offset:offset+8])[0]
             offset += 8
-            dblock.data_points.append([x, y])
+            dblock.data_points.append([off, x, y])
         return dblock
 
     def add_points(self, point):
@@ -988,10 +995,10 @@ class DataBlock:
         计算数据块的所有数据点对应的mbr
         :return:
         """
-        x1 = min([x for x, y in self.data_points])
-        y1 = min([y for x, y in self.data_points])
-        x2 = max([x for x, y in self.data_points])
-        y2 = max([y for x, y in self.data_points])
+        x1 = min([x for off, x, y in self.data_points])
+        y1 = min([y for off, x, y in self.data_points])
+        x2 = max([x for off, x, y in self.data_points])
+        y2 = max([y for off, x, y in self.data_points])
         return [x1, y1, x2, y2]
 
 
@@ -1018,7 +1025,7 @@ class InsertDataCache(Cache):
         if self.is_full():
             self.fifo()
 
-    def get_dblock(self,block_id):
+    def get_dblock(self, block_id):
         for id in self.id_block_map:
             if id==block_id:
                 return self.id_block_map[block_id]
